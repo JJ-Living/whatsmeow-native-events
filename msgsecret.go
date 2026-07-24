@@ -259,6 +259,29 @@ func (cli *Client) DecryptPollVote(ctx context.Context, vote *events.Message) (*
 	return &msg, nil
 }
 
+// DecryptEventResponse decrypts an RSVP response to a native WhatsApp event.
+func (cli *Client) DecryptEventResponse(ctx context.Context, response *events.Message) (*waE2E.EventResponseMessage, error) {
+	encResponse := response.Message.GetEncEventResponseMessage()
+	if encResponse == nil {
+		return nil, ErrNotEventResponseMessage
+	}
+	plaintext, err := cli.decryptMsgSecret(
+		ctx,
+		response,
+		EncSecretEventResponse,
+		encResponse,
+		encResponse.GetEventCreationMessageKey(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt event response: %w", err)
+	}
+	var msg waE2E.EventResponseMessage
+	if err = proto.Unmarshal(plaintext, &msg); err != nil {
+		return nil, fmt.Errorf("failed to decode event response protobuf: %w", err)
+	}
+	return &msg, nil
+}
+
 func (cli *Client) DecryptSecretEncryptedMessage(ctx context.Context, evt *events.Message) (*waE2E.Message, error) {
 	encMessage := evt.Message.GetSecretEncryptedMessage()
 	if encMessage == nil {
@@ -335,6 +358,22 @@ func (cli *Client) BuildPollVote(ctx context.Context, pollInfo *types.MessageInf
 	return &waE2E.Message{PollUpdateMessage: pollUpdate}, err
 }
 
+// BuildEventResponse builds an encrypted RSVP response to a native WhatsApp event.
+// The resulting message can be sent normally using Client.SendMessage.
+func (cli *Client) BuildEventResponse(
+	ctx context.Context,
+	eventInfo *types.MessageInfo,
+	response waE2E.EventResponseMessage_EventResponseType,
+	extraGuestCount int32,
+) (*waE2E.Message, error) {
+	encResponse, err := cli.EncryptEventResponse(ctx, eventInfo, &waE2E.EventResponseMessage{
+		Response:        response.Enum(),
+		TimestampMS:     proto.Int64(time.Now().UnixMilli()),
+		ExtraGuestCount: proto.Int32(extraGuestCount),
+	})
+	return &waE2E.Message{EncEventResponseMessage: encResponse}, err
+}
+
 // BuildPollCreation builds a poll creation message with the given poll name, options and maximum number of selections.
 // The built message can be sent normally using Client.SendMessage.
 //
@@ -360,6 +399,25 @@ func (cli *Client) BuildPollCreation(name string, optionNames []string, selectab
 	}
 }
 
+// BuildEventCreation builds a native WhatsApp event creation message and adds the
+// message secret required for encrypted RSVPs and event edits.
+func (cli *Client) BuildEventCreation(event *waE2E.EventMessage) *waE2E.Message {
+	if event == nil {
+		event = &waE2E.EventMessage{}
+	} else {
+		event = proto.Clone(event).(*waE2E.EventMessage)
+	}
+	if event.IsCanceled == nil {
+		event.IsCanceled = proto.Bool(false)
+	}
+	return &waE2E.Message{
+		EventMessage: event,
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			MessageSecret: random.Bytes(32),
+		},
+	}
+}
+
 // EncryptPollVote encrypts a poll vote message. This is a slightly lower-level function, using BuildPollVote is recommended.
 func (cli *Client) EncryptPollVote(ctx context.Context, pollInfo *types.MessageInfo, vote *waE2E.PollVoteMessage) (*waE2E.PollUpdateMessage, error) {
 	plaintext, err := proto.Marshal(vote)
@@ -381,6 +439,77 @@ func (cli *Client) EncryptPollVote(ctx context.Context, pollInfo *types.MessageI
 			EncIV:      iv,
 		},
 		SenderTimestampMS: proto.Int64(time.Now().UnixMilli()),
+	}, nil
+}
+
+// EncryptEventResponse encrypts an event RSVP. BuildEventResponse is recommended
+// unless the caller needs to provide a custom response timestamp.
+func (cli *Client) EncryptEventResponse(
+	ctx context.Context,
+	eventInfo *types.MessageInfo,
+	response *waE2E.EventResponseMessage,
+) (*waE2E.EncEventResponseMessage, error) {
+	plaintext, err := proto.Marshal(response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal event response protobuf: %w", err)
+	}
+	ownID := cli.getOwnLID()
+	if eventInfo.Sender.Server == types.DefaultUserServer {
+		ownID = cli.getOwnID()
+	}
+	ciphertext, iv, err := cli.encryptMsgSecret(
+		ctx,
+		ownID,
+		eventInfo.Chat,
+		eventInfo.Sender,
+		eventInfo.ID,
+		EncSecretEventResponse,
+		plaintext,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt event response: %w", err)
+	}
+	return &waE2E.EncEventResponseMessage{
+		EventCreationMessageKey: getKeyFromInfo(eventInfo),
+		EncPayload:              ciphertext,
+		EncIV:                   iv,
+	}, nil
+}
+
+// BuildEventEdit builds an encrypted native event update. Cancellation is an
+// event edit whose EventMessage.IsCanceled field is true.
+func (cli *Client) BuildEventEdit(
+	ctx context.Context,
+	eventInfo *types.MessageInfo,
+	event *waE2E.EventMessage,
+) (*waE2E.Message, error) {
+	plaintext, err := proto.Marshal(&waE2E.Message{EventMessage: event})
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
+	}
+	ownID := cli.getOwnLID()
+	if eventInfo.Sender.Server == types.DefaultUserServer {
+		ownID = cli.getOwnID()
+	}
+	ciphertext, iv, err := cli.encryptMsgSecret(
+		ctx,
+		ownID,
+		eventInfo.Chat,
+		eventInfo.Sender,
+		eventInfo.ID,
+		EncSecretEventEdit,
+		plaintext,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to encrypt event edit: %w", err)
+	}
+	return &waE2E.Message{
+		SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+			TargetMessageKey: getKeyFromInfo(eventInfo),
+			EncPayload:       ciphertext,
+			EncIV:            iv,
+			SecretEncType:    waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum(),
+		},
 	}, nil
 }
 

@@ -231,7 +231,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 
 	isBotMode := isInlineBotMode || to.IsBot()
-	needsMessageSecret := isBotMode || cli.shouldIncludeReportingToken(message)
+	needsMessageSecret := isBotMode || message.GetEventMessage() != nil || cli.shouldIncludeReportingToken(message)
 	var extraParams nodeExtraParams
 
 	if needsMessageSecret {
@@ -921,6 +921,11 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return getTypeFromMessage(msg.DocumentWithCaptionMessage.Message)
 	case msg.ReactionMessage != nil, msg.EncReactionMessage != nil:
 		return "reaction"
+	case msg.EventMessage != nil, msg.EncEventResponseMessage != nil:
+		return "event"
+	case msg.SecretEncryptedMessage != nil &&
+		msg.SecretEncryptedMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT:
+		return "event"
 	case msg.PollCreationMessage != nil, msg.PollUpdateMessage != nil:
 		return "poll"
 	case getMediaTypeFromMessage(msg) != "":
@@ -929,6 +934,19 @@ func getTypeFromMessage(msg *waE2E.Message) string {
 		return "text"
 	default:
 		return "text"
+	}
+}
+
+func getEventType(msg *waE2E.Message) string {
+	switch {
+	case msg.GetEventMessage() != nil:
+		return "creation"
+	case msg.GetEncEventResponseMessage() != nil:
+		return "response"
+	case msg.GetSecretEncryptedMessage().GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT:
+		return "edit"
+	default:
+		return ""
 	}
 }
 
@@ -1055,6 +1073,9 @@ func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
 		return types.EditAttributeSenderRevoke
 	case msg.PinInChatMessage != nil:
 		return types.EditAttributePinInChat
+	case msg.SecretEncryptedMessage != nil &&
+		msg.SecretEncryptedMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT:
+		return types.EditAttributeMessageEdit
 	}
 	return types.EditAttributeEmpty
 }
@@ -1137,6 +1158,14 @@ func (cli *Client) getMessageContent(
 			},
 		})
 	}
+	if eventType := getEventType(message); eventType != "" {
+		content = append(content, waBinary.Node{
+			Tag: "meta",
+			Attrs: waBinary.Attrs{
+				"event_type": eventType,
+			},
+		})
+	}
 
 	if extraParams.botNode != nil {
 		content = append(content, *extraParams.botNode)
@@ -1205,7 +1234,7 @@ func (cli *Client) prepareMessageNode(
 		attrs["edit"] = string(editAttr)
 		encAttrs["decrypt-fail"] = string(events.DecryptFailHide)
 	}
-	if msgType == "reaction" || message.GetPollUpdateMessage() != nil {
+	if msgType == "reaction" || message.GetPollUpdateMessage() != nil || message.GetEncEventResponseMessage() != nil {
 		encAttrs["decrypt-fail"] = string(events.DecryptFailHide)
 	}
 
