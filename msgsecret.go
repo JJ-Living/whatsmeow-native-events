@@ -320,6 +320,13 @@ func (cli *Client) DecryptSecretEncryptedMessage(ctx context.Context, evt *event
 		return nil, err
 	}
 	if encMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT {
+		var wrapped waE2E.Message
+		if err = proto.Unmarshal(plaintext, &wrapped); err == nil && wrapped.GetEventMessage() != nil {
+			if evt.Message.MessageContextInfo != nil && wrapped.MessageContextInfo == nil {
+				wrapped.MessageContextInfo = evt.Message.MessageContextInfo
+			}
+			return &wrapped, nil
+		}
 		var eventEdit waE2E.EventMessage
 		if err = proto.Unmarshal(plaintext, &eventEdit); err != nil {
 			return nil, fmt.Errorf("failed to decode event edit protobuf: %w", err)
@@ -347,7 +354,7 @@ func getKeyFromInfo(msgInfo *types.MessageInfo) *waCommon.MessageKey {
 		FromMe:    proto.Bool(msgInfo.IsFromMe),
 		ID:        proto.String(msgInfo.ID),
 	}
-	if msgInfo.IsGroup {
+	if msgInfo.IsGroup && !msgInfo.IsFromMe {
 		creationKey.Participant = proto.String(msgInfo.Sender.String())
 	}
 	return creationKey
@@ -509,7 +516,7 @@ func (cli *Client) BuildEventEdit(
 	eventInfo *types.MessageInfo,
 	event *waE2E.EventMessage,
 ) (*waE2E.Message, error) {
-	plaintext, err := proto.Marshal(event)
+	plaintext, err := proto.Marshal(&waE2E.Message{EventMessage: event})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
 	}

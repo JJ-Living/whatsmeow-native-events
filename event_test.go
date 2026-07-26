@@ -148,12 +148,16 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decrypt raw event edit failed: %v", err)
 	}
-	var wireEvent waE2E.EventMessage
-	if err = proto.Unmarshal(plaintext, &wireEvent); err != nil {
+	var wireMessage waE2E.Message
+	if err = proto.Unmarshal(plaintext, &wireMessage); err != nil {
 		t.Fatalf("decode raw event edit failed: %v", err)
 	}
-	if wireEvent.GetName() != "Updated dinner" || !wireEvent.GetIsCanceled() {
-		t.Fatalf("event edit wire payload is not a direct EventMessage: %v", &wireEvent)
+	wireEvent := wireMessage.GetEventMessage()
+	if wireEvent == nil || wireEvent.GetName() != "Updated dinner" || !wireEvent.GetIsCanceled() {
+		t.Fatalf("event edit wire payload is not Message{EventMessage}: %v", &wireMessage)
+	}
+	if encrypted.GetTargetMessageKey().GetParticipant() != "" {
+		t.Fatalf("from-me event target contains participant: %q", encrypted.GetTargetMessageKey().GetParticipant())
 	}
 	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
 	if err != nil {
@@ -161,6 +165,46 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	}
 	if decrypted.GetEventMessage().GetName() != "Updated dinner" || !decrypted.GetEventMessage().GetIsCanceled() {
 		t.Fatalf("unexpected decrypted event edit: %v", decrypted.GetEventMessage())
+	}
+}
+
+func TestDecryptEventEditAcceptsLegacyDirectPayload(t *testing.T) {
+	creator := types.NewJID("100000000001", types.HiddenUserServer)
+	cli, eventInfo := newEventTestClient(t, creator, true)
+	direct := &waE2E.EventMessage{Name: proto.String("Legacy direct event")}
+	plaintext, err := proto.Marshal(direct)
+	if err != nil {
+		t.Fatalf("marshal direct event: %v", err)
+	}
+	ciphertext, iv, err := cli.encryptMsgSecret(
+		context.Background(),
+		cli.getOwnID(),
+		eventInfo.Chat,
+		eventInfo.Sender,
+		eventInfo.ID,
+		EncSecretEventEdit,
+		plaintext,
+	)
+	if err != nil {
+		t.Fatalf("encrypt direct event: %v", err)
+	}
+	received := &events.Message{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{
+			Chat: eventInfo.Chat, Sender: cli.getOwnID(), IsFromMe: true, IsGroup: true,
+		}},
+		Message: &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+			TargetMessageKey: getKeyFromInfo(eventInfo),
+			EncPayload:       ciphertext,
+			EncIV:            iv,
+			SecretEncType:    waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum(),
+		}},
+	}
+	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
+	if err != nil {
+		t.Fatalf("decrypt direct event: %v", err)
+	}
+	if decrypted.GetEventMessage().GetName() != "Legacy direct event" {
+		t.Fatalf("unexpected legacy event: %v", decrypted.GetEventMessage())
 	}
 }
 
