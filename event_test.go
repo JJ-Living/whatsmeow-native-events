@@ -152,9 +152,22 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	if err = proto.Unmarshal(plaintext, &wireMessage); err != nil {
 		t.Fatalf("decode raw event edit failed: %v", err)
 	}
-	wireEvent := wireMessage.GetEventMessage()
+	wireProtocol := wireMessage.GetProtocolMessage()
+	if wireProtocol.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT {
+		t.Fatalf("event edit protocol type = %s, want MESSAGE_EDIT", wireProtocol.GetType())
+	}
+	if !proto.Equal(wireProtocol.GetKey(), encrypted.GetTargetMessageKey()) {
+		t.Fatalf("inner and outer event target keys differ")
+	}
+	if wireProtocol.GetTimestampMS() <= 0 {
+		t.Fatalf("event edit protocol timestamp is missing")
+	}
+	wireEvent := wireProtocol.GetEditedMessage().GetEventMessage()
 	if wireEvent == nil || wireEvent.GetName() != "Updated dinner" || !wireEvent.GetIsCanceled() {
-		t.Fatalf("event edit wire payload is not Message{EventMessage}: %v", &wireMessage)
+		t.Fatalf("event edit wire payload is not ProtocolMessage{EditedMessage{EventMessage}}: %v", &wireMessage)
+	}
+	if got := wireMessage.GetMessageContextInfo().GetMessageSecret(); !bytes.Equal(got, bytes.Repeat([]byte{0x42}, 32)) {
+		t.Fatalf("event edit context message secret differs from original")
 	}
 	if encrypted.GetTargetMessageKey().GetParticipant() != "" {
 		t.Fatalf("from-me event target contains participant: %q", encrypted.GetTargetMessageKey().GetParticipant())

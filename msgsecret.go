@@ -321,15 +321,30 @@ func (cli *Client) DecryptSecretEncryptedMessage(ctx context.Context, evt *event
 	}
 	if encMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT {
 		var wrapped waE2E.Message
-		if err = proto.Unmarshal(plaintext, &wrapped); err == nil && wrapped.GetEventMessage() != nil {
-			if evt.Message.MessageContextInfo != nil && wrapped.MessageContextInfo == nil {
-				wrapped.MessageContextInfo = evt.Message.MessageContextInfo
+		if err = proto.Unmarshal(plaintext, &wrapped); err == nil {
+			if protocol := wrapped.GetProtocolMessage(); protocol.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+				if edited := protocol.GetEditedMessage().GetEventMessage(); edited != nil {
+					return &waE2E.Message{
+						EventMessage:       edited,
+						MessageContextInfo: wrapped.GetMessageContextInfo(),
+					}, nil
+				}
 			}
-			return &wrapped, nil
+			if wrapped.GetEventMessage() != nil {
+				if evt.Message.MessageContextInfo != nil && wrapped.MessageContextInfo == nil {
+					wrapped.MessageContextInfo = evt.Message.MessageContextInfo
+				}
+				return &wrapped, nil
+			}
 		}
 		var eventEdit waE2E.EventMessage
 		if err = proto.Unmarshal(plaintext, &eventEdit); err != nil {
 			return nil, fmt.Errorf("failed to decode event edit protobuf: %w", err)
+		}
+		if eventEdit.Name == nil && eventEdit.Description == nil && eventEdit.Location == nil &&
+			eventEdit.JoinLink == nil && eventEdit.StartTime == nil && eventEdit.EndTime == nil &&
+			eventEdit.ExtraGuestsAllowed == nil && eventEdit.IsCanceled == nil {
+			return nil, fmt.Errorf("event edit plaintext has no supported EventMessage envelope")
 		}
 		msg := &waE2E.Message{EventMessage: &eventEdit}
 		if evt.Message.MessageContextInfo != nil {
@@ -516,7 +531,30 @@ func (cli *Client) BuildEventEdit(
 	eventInfo *types.MessageInfo,
 	event *waE2E.EventMessage,
 ) (*waE2E.Message, error) {
-	plaintext, err := proto.Marshal(&waE2E.Message{EventMessage: event})
+	messageSecret, _, err := cli.Store.MsgSecrets.GetMessageSecret(
+		ctx,
+		eventInfo.Chat,
+		eventInfo.Sender,
+		eventInfo.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get original event message secret: %w", err)
+	}
+	if len(messageSecret) == 0 {
+		return nil, ErrOriginalMessageSecretNotFound
+	}
+	originalKey := getKeyFromInfo(eventInfo)
+	plaintext, err := proto.Marshal(&waE2E.Message{
+		ProtocolMessage: &waE2E.ProtocolMessage{
+			Key:           originalKey,
+			Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			EditedMessage: &waE2E.Message{EventMessage: event},
+			TimestampMS:   proto.Int64(time.Now().UnixMilli()),
+		},
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			MessageSecret: messageSecret,
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
 	}
@@ -535,7 +573,7 @@ func (cli *Client) BuildEventEdit(
 	}
 	return &waE2E.Message{
 		SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
-			TargetMessageKey: getKeyFromInfo(eventInfo),
+			TargetMessageKey: originalKey,
 			EncPayload:       ciphertext,
 			EncIV:            iv,
 			SecretEncType:    waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum(),
