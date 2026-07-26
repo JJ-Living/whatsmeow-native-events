@@ -135,6 +135,24 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 		}},
 		Message: built,
 	}
+	encrypted := received.Message.GetSecretEncryptedMessage()
+	plaintext, err := cli.decryptMsgSecret(
+		context.Background(),
+		received,
+		EncSecretEventEdit,
+		encrypted,
+		encrypted.GetTargetMessageKey(),
+	)
+	if err != nil {
+		t.Fatalf("decrypt raw event edit failed: %v", err)
+	}
+	var wireEvent waE2E.EventMessage
+	if err = proto.Unmarshal(plaintext, &wireEvent); err != nil {
+		t.Fatalf("decode raw event edit failed: %v", err)
+	}
+	if wireEvent.GetName() != "Updated dinner" || !wireEvent.GetIsCanceled() {
+		t.Fatalf("event edit wire payload is not a direct EventMessage: %v", &wireEvent)
+	}
 	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
 	if err != nil {
 		t.Fatalf("DecryptSecretEncryptedMessage failed: %v", err)

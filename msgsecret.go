@@ -304,6 +304,17 @@ func (cli *Client) DecryptSecretEncryptedMessage(ctx context.Context, evt *event
 	if err != nil {
 		return nil, err
 	}
+	if encMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT {
+		var eventEdit waE2E.EventMessage
+		if err = proto.Unmarshal(plaintext, &eventEdit); err != nil {
+			return nil, fmt.Errorf("failed to decode event edit protobuf: %w", err)
+		}
+		msg := &waE2E.Message{EventMessage: &eventEdit}
+		if evt.Message.MessageContextInfo != nil {
+			msg.MessageContextInfo = evt.Message.MessageContextInfo
+		}
+		return msg, nil
+	}
 	var msg waE2E.Message
 	err = proto.Unmarshal(plaintext, &msg)
 	if err != nil {
@@ -483,7 +494,7 @@ func (cli *Client) BuildEventEdit(
 	eventInfo *types.MessageInfo,
 	event *waE2E.EventMessage,
 ) (*waE2E.Message, error) {
-	plaintext, err := proto.Marshal(&waE2E.Message{EventMessage: event})
+	plaintext, err := proto.Marshal(event)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
 	}
