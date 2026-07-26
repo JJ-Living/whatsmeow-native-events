@@ -128,13 +128,15 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	}
 	received := &events.Message{
 		Info: types.MessageInfo{MessageSource: types.MessageSource{
-			Chat:     eventInfo.Chat,
-			Sender:   creator,
-			IsFromMe: true,
-			IsGroup:  true,
+			Chat:      eventInfo.Chat,
+			Sender:    cli.getOwnLID(),
+			SenderAlt: cli.getOwnID(),
+			IsFromMe:  true,
+			IsGroup:   true,
 		}},
 		Message: built,
 	}
+	received.Info.ID = "EVENT-EDIT-ID"
 	encrypted := received.Message.GetSecretEncryptedMessage()
 	plaintext, err := cli.decryptMsgSecret(
 		context.Background(),
@@ -159,6 +161,32 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	}
 	if decrypted.GetEventMessage().GetName() != "Updated dinner" || !decrypted.GetEventMessage().GetIsCanceled() {
 		t.Fatalf("unexpected decrypted event edit: %v", decrypted.GetEventMessage())
+	}
+}
+
+func TestEventEditUsesPhoneIdentityForHKDF(t *testing.T) {
+	creator := types.NewJID("100000000001", types.HiddenUserServer)
+	cli, eventInfo := newEventTestClient(t, creator, true)
+	built, err := cli.BuildEventEdit(
+		context.Background(),
+		eventInfo,
+		&waE2E.EventMessage{Name: proto.String("Phone identity edit")},
+	)
+	if err != nil {
+		t.Fatalf("BuildEventEdit failed: %v", err)
+	}
+	received := &events.Message{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{
+			Chat: eventInfo.Chat, Sender: cli.getOwnID(), IsFromMe: true, IsGroup: true,
+		}},
+		Message: built,
+	}
+	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
+	if err != nil {
+		t.Fatalf("phone identity could not decrypt event edit: %v", err)
+	}
+	if decrypted.GetEventMessage().GetName() != "Phone identity edit" {
+		t.Fatalf("unexpected event edit: %v", decrypted.GetEventMessage())
 	}
 }
 

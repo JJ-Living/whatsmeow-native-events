@@ -110,35 +110,50 @@ func (cli *Client) decryptMsgSecret(ctx context.Context, msg *events.Message, us
 	if baseEncKey == nil {
 		return nil, ErrOriginalMessageSecretNotFound
 	}
-	secretKey, additionalData := generateMsgSecretKey(useCase, msg.Info.Sender, origMsgKey.GetID(), origSender, baseEncKey)
-	plaintext, err := gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
-	if err != nil {
-		// Hack for trying both the original sender in the new message and the one who we received the secret key from.
-		// This will hopefully become unnecessary when WhatsApp fully finishes their migration to LIDs.
-		if origSender != storedOrigSender && strings.Contains(err.Error(), "message authentication failed") {
-			secretKey, additionalData = generateMsgSecretKey(useCase, msg.Info.Sender, origMsgKey.GetID(), storedOrigSender, baseEncKey)
-			plaintext, err = gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
-			if err == nil {
+	modificationSenders := []types.JID{msg.Info.Sender}
+	if !msg.Info.SenderAlt.IsEmpty() && msg.Info.SenderAlt.ToNonAD() != msg.Info.Sender.ToNonAD() {
+		modificationSenders = append(modificationSenders, msg.Info.SenderAlt)
+	}
+	origSenders := []types.JID{origSender}
+	if !storedOrigSender.IsEmpty() && storedOrigSender.ToNonAD() != origSender.ToNonAD() {
+		origSenders = append(origSenders, storedOrigSender)
+	}
+
+	var decryptErr error
+	for _, modificationSender := range modificationSenders {
+		for _, candidateOrigSender := range origSenders {
+			secretKey, additionalData := generateMsgSecretKey(
+				useCase,
+				modificationSender,
+				origMsgKey.GetID(),
+				candidateOrigSender,
+				baseEncKey,
+			)
+			plaintext, candidateErr := gcmutil.Decrypt(
+				secretKey,
+				encrypted.GetEncIV(),
+				encrypted.GetEncPayload(),
+				additionalData,
+			)
+			if candidateErr == nil {
 				zerolog.Ctx(ctx).Debug().
 					Str("orig_message_id", origMsgKey.GetID()).
 					Str("secret_message_id", msg.Info.ID).
-					Stringer("stored_orig_sender", storedOrigSender).
-					Stringer("key_orig_sender", origSender).
-					Msg("Decrypted message secret with orig sender hack")
+					Stringer("modification_sender", modificationSender).
+					Stringer("orig_sender", candidateOrigSender).
+					Msg("Decrypted message secret")
+				return plaintext, nil
+			}
+			decryptErr = candidateErr
+			if !strings.Contains(candidateErr.Error(), "message authentication failed") {
+				break
 			}
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt secret message: %w (sender: %s, orig sender: %s and %s)", err, msg.Info.Sender, origSender, storedOrigSender)
-		}
-	} else {
-		zerolog.Ctx(ctx).Debug().
-			Str("orig_message_id", origMsgKey.GetID()).
-			Str("secret_message_id", msg.Info.ID).
-			Stringer("stored_orig_sender", storedOrigSender).
-			Stringer("key_orig_sender", origSender).
-			Msg("Decrypted message secret without hack")
 	}
-	return plaintext, nil
+	return nil, fmt.Errorf(
+		"failed to decrypt secret message: %w (sender: %s, sender alt: %s, orig sender: %s and %s)",
+		decryptErr, msg.Info.Sender, msg.Info.SenderAlt, origSender, storedOrigSender,
+	)
 }
 
 func (cli *Client) encryptMsgSecret(ctx context.Context, ownID, chat, origSender types.JID, origMsgID types.MessageID, useCase MsgSecretType, plaintext []byte) (ciphertext, iv []byte, err error) {
@@ -498,10 +513,7 @@ func (cli *Client) BuildEventEdit(
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
 	}
-	ownID := cli.getOwnLID()
-	if eventInfo.Sender.Server == types.DefaultUserServer {
-		ownID = cli.getOwnID()
-	}
+	ownID := cli.getOwnID()
 	ciphertext, iv, err := cli.encryptMsgSecret(
 		ctx,
 		ownID,
