@@ -19,6 +19,7 @@ type eventSecretStore struct {
 	sender types.JID
 	id     types.MessageID
 	secret []byte
+	exact  map[string][]byte
 }
 
 func (s *eventSecretStore) PutMessageSecrets(_ context.Context, inserts []store.MessageSecretInsert) error {
@@ -37,9 +38,16 @@ func (s *eventSecretStore) PutMessageSecret(_ context.Context, chat, sender type
 	return nil
 }
 
-func (s *eventSecretStore) GetMessageSecret(_ context.Context, chat, _ types.JID, id types.MessageID) ([]byte, types.JID, error) {
+func (s *eventSecretStore) GetMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID) ([]byte, types.JID, error) {
 	if chat != s.chat || id != s.id {
 		return nil, types.EmptyJID, nil
+	}
+	if s.exact != nil {
+		secret, ok := s.exact[sender.ToNonAD().String()]
+		if !ok {
+			return nil, types.EmptyJID, nil
+		}
+		return bytes.Clone(secret), sender.ToNonAD(), nil
 	}
 	return bytes.Clone(s.secret), s.sender, nil
 }
@@ -243,6 +251,40 @@ func TestEventEditUsesPhoneIdentityForHKDF(t *testing.T) {
 		t.Fatalf("phone identity could not decrypt event edit: %v", err)
 	}
 	if decrypted.GetEventMessage().GetName() != "Phone identity edit" {
+		t.Fatalf("unexpected event edit: %v", decrypted.GetEventMessage())
+	}
+}
+
+func TestEventEditUsesLIDIdentityForLegacyDualSecret(t *testing.T) {
+	creator := types.NewJID("100000000001", types.HiddenUserServer)
+	cli, eventInfo := newEventTestClient(t, creator, true)
+	secret := bytes.Repeat([]byte{0x42}, 32)
+	secretStore := cli.Store.MsgSecrets.(*eventSecretStore)
+	secretStore.exact = map[string][]byte{
+		creator.ToNonAD().String():        secret,
+		cli.getOwnID().ToNonAD().String(): secret,
+	}
+
+	built, err := cli.BuildEventEdit(
+		context.Background(),
+		eventInfo,
+		&waE2E.EventMessage{Name: proto.String("Legacy LID identity edit")},
+	)
+	if err != nil {
+		t.Fatalf("BuildEventEdit failed: %v", err)
+	}
+	received := &events.Message{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{
+			Chat: eventInfo.Chat, Sender: cli.getOwnLID(), SenderAlt: cli.getOwnID(),
+			IsFromMe: true, IsGroup: true,
+		}},
+		Message: built,
+	}
+	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
+	if err != nil {
+		t.Fatalf("LID identity could not decrypt legacy dual-secret event edit: %v", err)
+	}
+	if decrypted.GetEventMessage().GetName() != "Legacy LID identity edit" {
 		t.Fatalf("unexpected event edit: %v", decrypted.GetEventMessage())
 	}
 }

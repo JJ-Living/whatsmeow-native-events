@@ -887,6 +887,8 @@ const (
 					THEN (SELECT lid || '@lid' FROM whatsmeow_lid_map WHERE pn=replace($3, '@s.whatsapp.net', ''))
 			END
 		))
+		ORDER BY (sender_jid=$3) DESC, (chat_jid=$2) DESC
+		LIMIT 1
 	`
 )
 

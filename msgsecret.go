@@ -559,6 +559,20 @@ func (cli *Client) BuildEventEdit(
 		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
 	}
 	ownID := cli.getOwnID()
+	if eventInfo.IsFromMe && eventInfo.Sender.Server == types.HiddenUserServer && !cli.Store.LID.IsEmpty() {
+		_, exactSender, lookupErr := cli.Store.MsgSecrets.GetMessageSecret(
+			ctx,
+			eventInfo.Chat,
+			cli.getOwnID(),
+			eventInfo.ID,
+		)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("failed to inspect event message secret identity: %w", lookupErr)
+		}
+		if exactSender.ToNonAD() == cli.getOwnID().ToNonAD() {
+			ownID = cli.getOwnLID()
+		}
+	}
 	ciphertext, iv, err := cli.encryptMsgSecret(
 		ctx,
 		ownID,
