@@ -19,6 +19,7 @@ type eventSecretStore struct {
 	sender types.JID
 	id     types.MessageID
 	secret []byte
+	exact  map[string][]byte
 }
 
 func (s *eventSecretStore) PutMessageSecrets(_ context.Context, inserts []store.MessageSecretInsert) error {
@@ -37,9 +38,16 @@ func (s *eventSecretStore) PutMessageSecret(_ context.Context, chat, sender type
 	return nil
 }
 
-func (s *eventSecretStore) GetMessageSecret(_ context.Context, chat, _ types.JID, id types.MessageID) ([]byte, types.JID, error) {
+func (s *eventSecretStore) GetMessageSecret(_ context.Context, chat, sender types.JID, id types.MessageID) ([]byte, types.JID, error) {
 	if chat != s.chat || id != s.id {
 		return nil, types.EmptyJID, nil
+	}
+	if s.exact != nil {
+		secret, ok := s.exact[sender.ToNonAD().String()]
+		if !ok {
+			return nil, types.EmptyJID, nil
+		}
+		return bytes.Clone(secret), sender.ToNonAD(), nil
 	}
 	return bytes.Clone(s.secret), s.sender, nil
 }
@@ -128,12 +136,49 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	}
 	received := &events.Message{
 		Info: types.MessageInfo{MessageSource: types.MessageSource{
-			Chat:     eventInfo.Chat,
-			Sender:   creator,
-			IsFromMe: true,
-			IsGroup:  true,
+			Chat:      eventInfo.Chat,
+			Sender:    cli.getOwnLID(),
+			SenderAlt: cli.getOwnID(),
+			IsFromMe:  true,
+			IsGroup:   true,
 		}},
 		Message: built,
+	}
+	received.Info.ID = "EVENT-EDIT-ID"
+	encrypted := received.Message.GetSecretEncryptedMessage()
+	plaintext, err := cli.decryptMsgSecret(
+		context.Background(),
+		received,
+		EncSecretEventEdit,
+		encrypted,
+		encrypted.GetTargetMessageKey(),
+	)
+	if err != nil {
+		t.Fatalf("decrypt raw event edit failed: %v", err)
+	}
+	var wireMessage waE2E.Message
+	if err = proto.Unmarshal(plaintext, &wireMessage); err != nil {
+		t.Fatalf("decode raw event edit failed: %v", err)
+	}
+	wireProtocol := wireMessage.GetProtocolMessage()
+	if wireProtocol.GetType() != waE2E.ProtocolMessage_MESSAGE_EDIT {
+		t.Fatalf("event edit protocol type = %s, want MESSAGE_EDIT", wireProtocol.GetType())
+	}
+	if !proto.Equal(wireProtocol.GetKey(), encrypted.GetTargetMessageKey()) {
+		t.Fatalf("inner and outer event target keys differ")
+	}
+	if wireProtocol.GetTimestampMS() <= 0 {
+		t.Fatalf("event edit protocol timestamp is missing")
+	}
+	wireEvent := wireProtocol.GetEditedMessage().GetEventMessage()
+	if wireEvent == nil || wireEvent.GetName() != "Updated dinner" || !wireEvent.GetIsCanceled() {
+		t.Fatalf("event edit wire payload is not ProtocolMessage{EditedMessage{EventMessage}}: %v", &wireMessage)
+	}
+	if got := wireMessage.GetMessageContextInfo().GetMessageSecret(); !bytes.Equal(got, bytes.Repeat([]byte{0x42}, 32)) {
+		t.Fatalf("event edit context message secret differs from original")
+	}
+	if encrypted.GetTargetMessageKey().GetParticipant() != "" {
+		t.Fatalf("from-me event target contains participant: %q", encrypted.GetTargetMessageKey().GetParticipant())
 	}
 	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
 	if err != nil {
@@ -141,6 +186,106 @@ func TestEventEditEncryptionRoundTrip(t *testing.T) {
 	}
 	if decrypted.GetEventMessage().GetName() != "Updated dinner" || !decrypted.GetEventMessage().GetIsCanceled() {
 		t.Fatalf("unexpected decrypted event edit: %v", decrypted.GetEventMessage())
+	}
+}
+
+func TestDecryptEventEditAcceptsLegacyDirectPayload(t *testing.T) {
+	creator := types.NewJID("100000000001", types.HiddenUserServer)
+	cli, eventInfo := newEventTestClient(t, creator, true)
+	direct := &waE2E.EventMessage{Name: proto.String("Legacy direct event")}
+	plaintext, err := proto.Marshal(direct)
+	if err != nil {
+		t.Fatalf("marshal direct event: %v", err)
+	}
+	ciphertext, iv, err := cli.encryptMsgSecret(
+		context.Background(),
+		cli.getOwnID(),
+		eventInfo.Chat,
+		eventInfo.Sender,
+		eventInfo.ID,
+		EncSecretEventEdit,
+		plaintext,
+	)
+	if err != nil {
+		t.Fatalf("encrypt direct event: %v", err)
+	}
+	received := &events.Message{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{
+			Chat: eventInfo.Chat, Sender: cli.getOwnID(), IsFromMe: true, IsGroup: true,
+		}},
+		Message: &waE2E.Message{SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
+			TargetMessageKey: getKeyFromInfo(eventInfo),
+			EncPayload:       ciphertext,
+			EncIV:            iv,
+			SecretEncType:    waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum(),
+		}},
+	}
+	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
+	if err != nil {
+		t.Fatalf("decrypt direct event: %v", err)
+	}
+	if decrypted.GetEventMessage().GetName() != "Legacy direct event" {
+		t.Fatalf("unexpected legacy event: %v", decrypted.GetEventMessage())
+	}
+}
+
+func TestEventEditUsesPhoneIdentityForHKDF(t *testing.T) {
+	creator := types.NewJID("100000000001", types.HiddenUserServer)
+	cli, eventInfo := newEventTestClient(t, creator, true)
+	built, err := cli.BuildEventEdit(
+		context.Background(),
+		eventInfo,
+		&waE2E.EventMessage{Name: proto.String("Phone identity edit")},
+	)
+	if err != nil {
+		t.Fatalf("BuildEventEdit failed: %v", err)
+	}
+	received := &events.Message{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{
+			Chat: eventInfo.Chat, Sender: cli.getOwnID(), IsFromMe: true, IsGroup: true,
+		}},
+		Message: built,
+	}
+	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
+	if err != nil {
+		t.Fatalf("phone identity could not decrypt event edit: %v", err)
+	}
+	if decrypted.GetEventMessage().GetName() != "Phone identity edit" {
+		t.Fatalf("unexpected event edit: %v", decrypted.GetEventMessage())
+	}
+}
+
+func TestEventEditUsesLIDIdentityForLegacyDualSecret(t *testing.T) {
+	creator := types.NewJID("100000000001", types.HiddenUserServer)
+	cli, eventInfo := newEventTestClient(t, creator, true)
+	secret := bytes.Repeat([]byte{0x42}, 32)
+	secretStore := cli.Store.MsgSecrets.(*eventSecretStore)
+	secretStore.exact = map[string][]byte{
+		creator.ToNonAD().String():        secret,
+		cli.getOwnID().ToNonAD().String(): secret,
+	}
+
+	built, err := cli.BuildEventEdit(
+		context.Background(),
+		eventInfo,
+		&waE2E.EventMessage{Name: proto.String("Legacy LID identity edit")},
+	)
+	if err != nil {
+		t.Fatalf("BuildEventEdit failed: %v", err)
+	}
+	received := &events.Message{
+		Info: types.MessageInfo{MessageSource: types.MessageSource{
+			Chat: eventInfo.Chat, Sender: cli.getOwnLID(), SenderAlt: cli.getOwnID(),
+			IsFromMe: true, IsGroup: true,
+		}},
+		Message: built,
+	}
+	decrypted, err := cli.DecryptSecretEncryptedMessage(context.Background(), received)
+	if err != nil {
+		t.Fatalf("LID identity could not decrypt legacy dual-secret event edit: %v", err)
+	}
+	if decrypted.GetEventMessage().GetName() != "Legacy LID identity edit" {
+		t.Fatalf("unexpected event edit: %v", decrypted.GetEventMessage())
 	}
 }
 

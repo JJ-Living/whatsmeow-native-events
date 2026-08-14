@@ -110,35 +110,50 @@ func (cli *Client) decryptMsgSecret(ctx context.Context, msg *events.Message, us
 	if baseEncKey == nil {
 		return nil, ErrOriginalMessageSecretNotFound
 	}
-	secretKey, additionalData := generateMsgSecretKey(useCase, msg.Info.Sender, origMsgKey.GetID(), origSender, baseEncKey)
-	plaintext, err := gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
-	if err != nil {
-		// Hack for trying both the original sender in the new message and the one who we received the secret key from.
-		// This will hopefully become unnecessary when WhatsApp fully finishes their migration to LIDs.
-		if origSender != storedOrigSender && strings.Contains(err.Error(), "message authentication failed") {
-			secretKey, additionalData = generateMsgSecretKey(useCase, msg.Info.Sender, origMsgKey.GetID(), storedOrigSender, baseEncKey)
-			plaintext, err = gcmutil.Decrypt(secretKey, encrypted.GetEncIV(), encrypted.GetEncPayload(), additionalData)
-			if err == nil {
+	modificationSenders := []types.JID{msg.Info.Sender}
+	if !msg.Info.SenderAlt.IsEmpty() && msg.Info.SenderAlt.ToNonAD() != msg.Info.Sender.ToNonAD() {
+		modificationSenders = append(modificationSenders, msg.Info.SenderAlt)
+	}
+	origSenders := []types.JID{origSender}
+	if !storedOrigSender.IsEmpty() && storedOrigSender.ToNonAD() != origSender.ToNonAD() {
+		origSenders = append(origSenders, storedOrigSender)
+	}
+
+	var decryptErr error
+	for _, modificationSender := range modificationSenders {
+		for _, candidateOrigSender := range origSenders {
+			secretKey, additionalData := generateMsgSecretKey(
+				useCase,
+				modificationSender,
+				origMsgKey.GetID(),
+				candidateOrigSender,
+				baseEncKey,
+			)
+			plaintext, candidateErr := gcmutil.Decrypt(
+				secretKey,
+				encrypted.GetEncIV(),
+				encrypted.GetEncPayload(),
+				additionalData,
+			)
+			if candidateErr == nil {
 				zerolog.Ctx(ctx).Debug().
 					Str("orig_message_id", origMsgKey.GetID()).
 					Str("secret_message_id", msg.Info.ID).
-					Stringer("stored_orig_sender", storedOrigSender).
-					Stringer("key_orig_sender", origSender).
-					Msg("Decrypted message secret with orig sender hack")
+					Stringer("modification_sender", modificationSender).
+					Stringer("orig_sender", candidateOrigSender).
+					Msg("Decrypted message secret")
+				return plaintext, nil
+			}
+			decryptErr = candidateErr
+			if !strings.Contains(candidateErr.Error(), "message authentication failed") {
+				break
 			}
 		}
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt secret message: %w (sender: %s, orig sender: %s and %s)", err, msg.Info.Sender, origSender, storedOrigSender)
-		}
-	} else {
-		zerolog.Ctx(ctx).Debug().
-			Str("orig_message_id", origMsgKey.GetID()).
-			Str("secret_message_id", msg.Info.ID).
-			Stringer("stored_orig_sender", storedOrigSender).
-			Stringer("key_orig_sender", origSender).
-			Msg("Decrypted message secret without hack")
 	}
-	return plaintext, nil
+	return nil, fmt.Errorf(
+		"failed to decrypt secret message: %w (sender: %s, sender alt: %s, orig sender: %s and %s)",
+		decryptErr, msg.Info.Sender, msg.Info.SenderAlt, origSender, storedOrigSender,
+	)
 }
 
 func (cli *Client) encryptMsgSecret(ctx context.Context, ownID, chat, origSender types.JID, origMsgID types.MessageID, useCase MsgSecretType, plaintext []byte) (ciphertext, iv []byte, err error) {
@@ -304,6 +319,39 @@ func (cli *Client) DecryptSecretEncryptedMessage(ctx context.Context, evt *event
 	if err != nil {
 		return nil, err
 	}
+	if encMessage.GetSecretEncType() == waE2E.SecretEncryptedMessage_EVENT_EDIT {
+		var wrapped waE2E.Message
+		if err = proto.Unmarshal(plaintext, &wrapped); err == nil {
+			if protocol := wrapped.GetProtocolMessage(); protocol.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT {
+				if edited := protocol.GetEditedMessage().GetEventMessage(); edited != nil {
+					return &waE2E.Message{
+						EventMessage:       edited,
+						MessageContextInfo: wrapped.GetMessageContextInfo(),
+					}, nil
+				}
+			}
+			if wrapped.GetEventMessage() != nil {
+				if evt.Message.MessageContextInfo != nil && wrapped.MessageContextInfo == nil {
+					wrapped.MessageContextInfo = evt.Message.MessageContextInfo
+				}
+				return &wrapped, nil
+			}
+		}
+		var eventEdit waE2E.EventMessage
+		if err = proto.Unmarshal(plaintext, &eventEdit); err != nil {
+			return nil, fmt.Errorf("failed to decode event edit protobuf: %w", err)
+		}
+		if eventEdit.Name == nil && eventEdit.Description == nil && eventEdit.Location == nil &&
+			eventEdit.JoinLink == nil && eventEdit.StartTime == nil && eventEdit.EndTime == nil &&
+			eventEdit.ExtraGuestsAllowed == nil && eventEdit.IsCanceled == nil {
+			return nil, fmt.Errorf("event edit plaintext has no supported EventMessage envelope")
+		}
+		msg := &waE2E.Message{EventMessage: &eventEdit}
+		if evt.Message.MessageContextInfo != nil {
+			msg.MessageContextInfo = evt.Message.MessageContextInfo
+		}
+		return msg, nil
+	}
 	var msg waE2E.Message
 	err = proto.Unmarshal(plaintext, &msg)
 	if err != nil {
@@ -321,7 +369,7 @@ func getKeyFromInfo(msgInfo *types.MessageInfo) *waCommon.MessageKey {
 		FromMe:    proto.Bool(msgInfo.IsFromMe),
 		ID:        proto.String(msgInfo.ID),
 	}
-	if msgInfo.IsGroup {
+	if msgInfo.IsGroup && !msgInfo.IsFromMe {
 		creationKey.Participant = proto.String(msgInfo.Sender.String())
 	}
 	return creationKey
@@ -483,13 +531,47 @@ func (cli *Client) BuildEventEdit(
 	eventInfo *types.MessageInfo,
 	event *waE2E.EventMessage,
 ) (*waE2E.Message, error) {
-	plaintext, err := proto.Marshal(&waE2E.Message{EventMessage: event})
+	messageSecret, _, err := cli.Store.MsgSecrets.GetMessageSecret(
+		ctx,
+		eventInfo.Chat,
+		eventInfo.Sender,
+		eventInfo.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get original event message secret: %w", err)
+	}
+	if len(messageSecret) == 0 {
+		return nil, ErrOriginalMessageSecretNotFound
+	}
+	originalKey := getKeyFromInfo(eventInfo)
+	plaintext, err := proto.Marshal(&waE2E.Message{
+		ProtocolMessage: &waE2E.ProtocolMessage{
+			Key:           originalKey,
+			Type:          waE2E.ProtocolMessage_MESSAGE_EDIT.Enum(),
+			EditedMessage: &waE2E.Message{EventMessage: event},
+			TimestampMS:   proto.Int64(time.Now().UnixMilli()),
+		},
+		MessageContextInfo: &waE2E.MessageContextInfo{
+			MessageSecret: messageSecret,
+		},
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal event edit protobuf: %w", err)
 	}
-	ownID := cli.getOwnLID()
-	if eventInfo.Sender.Server == types.DefaultUserServer {
-		ownID = cli.getOwnID()
+	ownID := cli.getOwnID()
+	if eventInfo.IsFromMe && eventInfo.Sender.Server == types.HiddenUserServer && !cli.Store.LID.IsEmpty() {
+		_, exactSender, lookupErr := cli.Store.MsgSecrets.GetMessageSecret(
+			ctx,
+			eventInfo.Chat,
+			cli.getOwnID(),
+			eventInfo.ID,
+		)
+		if lookupErr != nil {
+			return nil, fmt.Errorf("failed to inspect event message secret identity: %w", lookupErr)
+		}
+		if exactSender.ToNonAD() == cli.getOwnID().ToNonAD() {
+			ownID = cli.getOwnLID()
+		}
 	}
 	ciphertext, iv, err := cli.encryptMsgSecret(
 		ctx,
@@ -505,7 +587,7 @@ func (cli *Client) BuildEventEdit(
 	}
 	return &waE2E.Message{
 		SecretEncryptedMessage: &waE2E.SecretEncryptedMessage{
-			TargetMessageKey: getKeyFromInfo(eventInfo),
+			TargetMessageKey: originalKey,
 			EncPayload:       ciphertext,
 			EncIV:            iv,
 			SecretEncType:    waE2E.SecretEncryptedMessage_EVENT_EDIT.Enum(),
